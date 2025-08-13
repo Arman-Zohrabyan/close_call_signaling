@@ -1,4 +1,3 @@
-// server.js
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -18,27 +17,107 @@ app.get('/', (req, res) => res.send('Signaling Server Running'));
 
 const rooms = new Map();
 
+function removeUserFromRoom(userId, roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+
+  room.users.delete(userId);
+  
+  if (room.users.size === 0) {
+    rooms.delete(roomId);
+    console.log(`Room ${roomId} deleted (empty)`);
+    return;
+  }
+
+  if (room.host === userId) {
+    const newHost = Array.from(room.users)[0];
+    room.host = newHost;
+    io.to(roomId).emit('new-host', newHost);
+    console.log(`New host for room ${roomId}: ${newHost}`);
+  }
+}
+
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // Create or join room
-  socket.on('join-room', (roomId) => {
-    socket.join(roomId);
+  socket.on('create-room', (data) => {
+    const { roomId, settings } = data;
     
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, new Set());
+    if (rooms.has(roomId)) {
+      socket.emit('room-error', 'Room already exists');
+      return;
     }
-    rooms.get(roomId).add(socket.id);
+
+    const room = {
+      id: roomId,
+      host: socket.id,
+      users: new Set([socket.id]),
+      settings: settings,
+      gameStarted: false,
+      createdAt: Date.now()
+    };
+
+    rooms.set(roomId, room);
+    socket.join(roomId);
+    socket.currentRoom = roomId;
     
-    // Notify others in room
-    socket.to(roomId).emit('user-joined', socket.id);
-    
-    // Send existing users to new joiner
-    const existingUsers = Array.from(rooms.get(roomId)).filter(id => id !== socket.id);
-    socket.emit('existing-users', existingUsers);
+    console.log(`Room ${roomId} created by ${socket.id}`);
+    socket.emit('room-created', true);
+    socket.emit('existing-users', []);
   });
 
-  // WebRTC signaling
+  socket.on('join-room', (roomId) => {
+    const room = rooms.get(roomId);
+    
+    if (!room) {
+      socket.emit('room-error', 'Room not exist');
+      return;
+    }
+
+    if (room.gameStarted) {
+      socket.emit('room-error', 'Room is in progress');
+      return;
+    }
+
+    if (room.users.size >= room.settings.maxUsers) {
+      socket.emit('room-error', 'Room is full');
+      return;
+    }
+
+    socket.join(roomId);
+    socket.currentRoom = roomId;
+    room.users.add(socket.id);
+    
+    const existingUsers = Array.from(room.users).filter(id => id !== socket.id);
+    socket.emit('room-joined', {
+      settings: room.settings,
+      gameStarted: room.gameStarted
+    });
+    socket.emit('existing-users', existingUsers);
+    socket.to(roomId).emit('user-joined', socket.id);
+    
+    console.log(`User ${socket.id} joined room ${roomId}`);
+  });
+
+  socket.on('leave-room', () => {
+    if (socket.currentRoom) {
+      removeUserFromRoom(socket.id, socket.currentRoom);
+      socket.leave(socket.currentRoom);
+      socket.currentRoom = null;
+    }
+  });
+
+  socket.on('start-game', () => {
+    if (socket.currentRoom) {
+      const room = rooms.get(socket.currentRoom);
+      if (room && room.host === socket.id && !room.gameStarted) {
+        room.gameStarted = true;
+        socket.to(socket.currentRoom).emit('game-started');
+        console.log(`Game started in room ${socket.currentRoom}`);
+      }
+    }
+  });
+
   socket.on('offer', (data) => {
     socket.to(data.target).emit('offer', {
       sdp: data.sdp,
@@ -60,28 +139,35 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Game events (pass-through)
   socket.on('game-event', (data) => {
-    socket.to(data.roomId).emit('game-event', data);
+    if (socket.currentRoom) {
+      socket.to(socket.currentRoom).emit('game-event', data);
+    }
   });
 
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
-    // Clean up rooms
-    rooms.forEach((users, roomId) => {
-      if (users.has(socket.id)) {
-        users.delete(socket.id);
-        socket.to(roomId).emit('user-left', socket.id);
-        if (users.size === 0) {
-          rooms.delete(roomId);
-        }
-      }
-    });
+    
+    if (socket.currentRoom) {
+      removeUserFromRoom(socket.id, socket.currentRoom);
+      io.to(socket.currentRoom).emit('user-left', socket.id);
+    }
   });
 });
+
+setInterval(() => {
+  const now = Date.now();
+  const oneHour = 60 * 60 * 1000;
+  
+  rooms.forEach((room, roomId) => {
+    if (now - room.createdAt > oneHour) {
+      rooms.delete(roomId);
+      console.log(`Cleaned up old room: ${roomId}`);
+    }
+  });
+}, 10 * 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Signaling server running on port ${PORT}`);
 });
-
