@@ -77,27 +77,33 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const { settings } = data;
+      const { settings, roomId } = data;
       
       if (!validateSettings(settings)) {
         socket.emit('room-error', 'Invalid game settings');
         return;
       }
-      
-      let roomId;
-      let attempts = 0;
-      do {
-        roomId = generateRoomId();
-        attempts++;
-      } while (rooms.has(roomId) && attempts < 10);
 
-      if (attempts >= 10) {
-        socket.emit('room-error', 'Failed to generate unique room ID');
-        return;
+      let finalRoomId = roomId;
+      if (finalRoomId) {
+        if (!/^\d{6}$/.test(finalRoomId)) {
+          socket.emit('room-error', 'Room ID must be exactly 6 digits');
+          return;
+        }
+        if (rooms.has(finalRoomId)) {
+          socket.emit('room-error', 'Room ID already exists');
+          return;
+        }
+      } else {
+        let attempts = 0;
+        do {
+          finalRoomId = generateRoomId();
+          attempts++;
+        } while (rooms.has(finalRoomId) && attempts < 10);
       }
 
       const room = {
-        id: roomId,
+        id: finalRoomId,
         host: socket.id,
         users: new Set([socket.id]),
         settings: settings,
@@ -105,12 +111,12 @@ io.on('connection', (socket) => {
         createdAt: Date.now()
       };
 
-      rooms.set(roomId, room);
-      userRooms.set(socket.id, roomId);
-      socket.join(roomId);
+      rooms.set(finalRoomId, room);
+      userRooms.set(socket.id, finalRoomId);
+      socket.join(finalRoomId);
       
-      console.log(`Room ${roomId} created by ${socket.id}`);
-      socket.emit('room-created', { success: true, roomId });
+      console.log(`Room ${finalRoomId} created by ${socket.id}`);
+      socket.emit('room-created', { success: true, roomId: finalRoomId });
       socket.emit('existing-users', []);
     } catch (error) {
       console.error('Error creating room:', error);
