@@ -21,20 +21,15 @@ app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: Date.now() 
 
 const rooms = new Map();
 const userRooms = new Map();
-const activeNicknames = new Set();
-const socketToIdentifier = new Map();
+const activeNicknames = new Map(); // Map deviceId -> nickname
+const socketToUser = new Map(); // Map socketId -> {nickname, deviceId}
 
-function extractNickname(userIdentifier) {
-  const parts = userIdentifier.split('_');
-  return parts.slice(0, -1).join('_') || userIdentifier;
-}
-
-function removeUserFromRoom(userIdentifier, roomId) {
+function removeUserFromRoom(socketId, roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
 
-  room.users.delete(userIdentifier);
-  userRooms.delete(userIdentifier);
+  room.users.delete(socketId);
+  userRooms.delete(socketId);
   
   if (room.users.size === 0) {
     rooms.delete(roomId);
@@ -42,7 +37,7 @@ function removeUserFromRoom(userIdentifier, roomId) {
     return;
   }
 
-  if (room.host === userIdentifier) {
+  if (room.host === socketId) {
     const newHost = Array.from(room.users)[0];
     room.host = newHost;
     io.to(roomId).emit('new-host', newHost);
@@ -69,26 +64,35 @@ function validateSettings(settings) {
 }
 
 io.on('connection', (socket) => {
-  const userIdentifier = socket.handshake.auth?.userIdentifier;
+  const userAuth = socket.handshake.auth;
   
-  if (!userIdentifier) {
-    socket.emit('room-error', 'Invalid user identifier');
+  if (!userAuth || !userAuth.nickname || !userAuth.deviceId) {
+    socket.emit('room-error', 'Invalid user credentials');
     socket.disconnect();
     return;
   }
 
-  const nickname = extractNickname(userIdentifier);
+  const { nickname, deviceId } = userAuth;
   
-  if (activeNicknames.has(nickname)) {
-    socket.emit('nickname-taken', `Nickname "${nickname}" is already in use. Please choose another one.`);
-    socket.disconnect();
-    return;
+  // Check if nickname is already taken by a different device
+  const existingNickname = activeNicknames.get(deviceId);
+  if (existingNickname && existingNickname !== nickname) {
+    // Same device, different nickname - update it
+    activeNicknames.set(deviceId, nickname);
+  } else {
+    // Check if nickname is taken by another device
+    const nicknameInUse = Array.from(activeNicknames.values()).includes(nickname);
+    if (nicknameInUse) {
+      socket.emit('nickname-taken', `Nickname "${nickname}" is already in use. Please choose another one.`);
+      socket.disconnect();
+      return;
+    }
+    activeNicknames.set(deviceId, nickname);
   }
 
-  activeNicknames.add(nickname);
-  socketToIdentifier.set(socket.id, userIdentifier);
+  socketToUser.set(socket.id, { nickname, deviceId });
   
-  console.log('User connected:', userIdentifier);
+  console.log('User connected:', socket.id, 'Nickname:', nickname);
   
   socket.on('ping', (callback) => {
     if (typeof callback === 'function') {
@@ -130,18 +134,18 @@ io.on('connection', (socket) => {
 
       const room = {
         id: finalRoomId,
-        host: userIdentifier,
-        users: new Set([userIdentifier]),
+        host: socket.id,
+        users: new Set([socket.id]),
         settings: settings,
         gameStarted: false,
         createdAt: Date.now()
       };
 
       rooms.set(finalRoomId, room);
-      userRooms.set(userIdentifier, finalRoomId);
+      userRooms.set(socket.id, finalRoomId);
       socket.join(finalRoomId);
       
-      console.log(`Room ${finalRoomId} created by ${userIdentifier}`);
+      console.log(`Room ${finalRoomId} created by ${socket.id} (${nickname})`);
       socket.emit('room-created', { success: true, roomId: finalRoomId });
       socket.emit('existing-users', []);
     } catch (error) {
@@ -194,16 +198,27 @@ io.on('connection', (socket) => {
         return;
       }
 
-      if (room.users.has(userIdentifier)) {
+      if (room.users.has(socket.id)) {
         socket.emit('room-error', 'Already in room');
         return;
       }
 
       socket.join(roomId);
-      userRooms.set(userIdentifier, roomId);
-      room.users.add(userIdentifier);
+      userRooms.set(socket.id, roomId);
+      room.users.add(socket.id);
       
-      const existingUsers = Array.from(room.users).filter(id => id !== userIdentifier);
+      // Send existing users with their info
+      const existingUsers = Array.from(room.users)
+        .filter(id => id !== socket.id)
+        .map(id => {
+          const user = socketToUser.get(id);
+          return {
+            id,
+            nickname: user?.nickname || 'Unknown',
+            deviceId: user?.deviceId || ''
+          };
+        });
+
       socket.emit('room-joined', {
         settings: room.settings,
         gameStarted: room.gameStarted,
@@ -211,9 +226,15 @@ io.on('connection', (socket) => {
         roomId: roomId
       });
       socket.emit('existing-users', existingUsers);
-      socket.to(roomId).emit('user-joined', userIdentifier);
       
-      console.log(`User ${userIdentifier} joined room ${roomId} (${room.users.size}/${room.settings.maxUsers})`);
+      // Notify others about the new user
+      socket.to(roomId).emit('user-joined', {
+        id: socket.id,
+        nickname,
+        deviceId
+      });
+      
+      console.log(`User ${socket.id} (${nickname}) joined room ${roomId} (${room.users.size}/${room.settings.maxUsers})`);
     } catch (error) {
       console.error('Error joining room:', error);
       socket.emit('room-error', 'Failed to join room');
@@ -348,24 +369,27 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', (reason) => {
-    console.log('User disconnected:', userIdentifier, 'Reason:', reason);
+    const userData = socketToUser.get(socket.id);
+    console.log('User disconnected:', socket.id, userData?.nickname, 'Reason:', reason);
     
     try {
-      const roomId = userRooms.get(userIdentifier);
+      const roomId = userRooms.get(socket.id);
       if (roomId) {
-        removeUserFromRoom(userIdentifier, roomId);
-        socket.to(roomId).emit('user-left', userIdentifier);
+        removeUserFromRoom(socket.id, roomId);
+        socket.to(roomId).emit('user-left', socket.id);
       }
       
-      activeNicknames.delete(nickname);
-      socketToIdentifier.delete(socket.id);
+      if (userData) {
+        activeNicknames.delete(userData.deviceId);
+      }
+      socketToUser.delete(socket.id);
     } catch (error) {
       console.error('Error handling disconnect:', error);
     }
   });
 
   socket.on('error', (error) => {
-    console.error('Socket error:', userIdentifier, error);
+    console.error('Socket error:', socket.id, error);
   });
 });
 
