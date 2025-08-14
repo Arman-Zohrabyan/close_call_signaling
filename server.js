@@ -16,8 +16,42 @@ const io = socketIo(server, {
 });
 
 app.use(cors());
+app.use(express.json());
+
 app.get('/', (req, res) => res.send('Signaling Server Running'));
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: Date.now() }));
+
+// Add user validation endpoint
+app.post('/validate-user', (req, res) => {
+  try {
+    const { nickname, deviceId } = req.body;
+    
+    if (!nickname || !deviceId) {
+      return res.json({ valid: false, reason: 'Missing credentials' });
+    }
+    
+    // Check if nickname is taken by a different device
+    const existingDevice = activeNicknames.get(deviceId);
+    const nicknameInUse = Array.from(activeNicknames.entries())
+      .find(([id, nick]) => nick === nickname && id !== deviceId);
+    
+    if (nicknameInUse) {
+      return res.json({ valid: false, reason: 'Nickname taken by another user' });
+    }
+    
+    // If this device had a different nickname, allow nickname change
+    if (existingDevice && existingDevice !== nickname) {
+      return res.json({ valid: true, nickname, deviceId });
+    }
+    
+    // Valid user
+    return res.json({ valid: true, nickname, deviceId });
+    
+  } catch (error) {
+    console.error('Error validating user:', error);
+    res.json({ valid: false, reason: 'Server error' });
+  }
+});
 
 const rooms = new Map();
 const userRooms = new Map();
@@ -74,22 +108,21 @@ io.on('connection', (socket) => {
 
   const { nickname, deviceId } = userAuth;
   
-  const existingNickname = activeNicknames.get(deviceId);
-  if (existingNickname && existingNickname !== nickname) {
-    activeNicknames.set(deviceId, nickname);
-  } else {
-    const nicknameInUse = Array.from(activeNicknames.values()).includes(nickname);
-    if (nicknameInUse) {
-      socket.emit('nickname-taken', `Nickname "${nickname}" is already in use. Please choose another one.`);
-      socket.disconnect();
-      return;
-    }
-    activeNicknames.set(deviceId, nickname);
+  // Check if nickname is taken by a different device
+  const nicknameInUse = Array.from(activeNicknames.entries())
+    .find(([id, nick]) => nick === nickname && id !== deviceId);
+    
+  if (nicknameInUse) {
+    socket.emit('nickname-taken', `Nickname "${nickname}" is already in use. Please choose another one.`);
+    socket.disconnect();
+    return;
   }
-
+  
+  // Set or update nickname for this device
+  activeNicknames.set(deviceId, nickname);
   socketToUser.set(socket.id, { nickname, deviceId });
   
-  console.log('User connected:', socket.id, 'Nickname:', nickname);
+  console.log('User connected:', socket.id, 'Nickname:', nickname, 'Device:', deviceId);
   
   socket.on('ping', (callback) => {
     if (typeof callback === 'function') {
@@ -374,9 +407,8 @@ io.on('connection', (socket) => {
         socket.to(roomId).emit('user-left', socket.id);
       }
       
-      if (userData) {
-        activeNicknames.delete(userData.deviceId);
-      }
+      // Don't remove from activeNicknames on disconnect - keep for persistence
+      // activeNicknames.delete(userData.deviceId);
       socketToUser.delete(socket.id);
     } catch (error) {
       console.error('Error handling disconnect:', error);
@@ -388,9 +420,20 @@ io.on('connection', (socket) => {
   });
 });
 
+// Clean up old nicknames (optional - removes inactive nicknames after 24 hours)
 setInterval(() => {
   try {
     const now = Date.now();
+    const oneDay = 24 * 60 * 60 * 1000;
+    let cleanedNicknames = 0;
+    
+    // This is optional - you can remove this if you want permanent nickname reservation
+    /*
+    activeNicknames.forEach((nickname, deviceId) => {
+      // Add timestamp tracking if needed for nickname cleanup
+    });
+    */
+    
     const oneHour = 60 * 60 * 1000;
     let cleanedRooms = 0;
     
