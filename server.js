@@ -43,11 +43,8 @@ function removeUserFromRoom(userId, roomId) {
   }
 }
 
-function validateRoomData(data) {
-  if (!data || typeof data !== 'object') return false;
-  if (!data.roomId || typeof data.roomId !== 'string') return false;
-  if (data.roomId.length > 50 || data.roomId.length < 1) return false;
-  return true;
+function generateRoomId() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
 function validateSettings(settings) {
@@ -58,7 +55,7 @@ function validateSettings(settings) {
   if (!Number.isInteger(answerTime) || answerTime < 5 || answerTime > 60) return false;
   if (!Number.isInteger(questionCount) || questionCount < 1 || questionCount > 50) return false;
   if (typeof isPrivate !== 'boolean') return false;
-  if (!roomName || typeof roomName !== 'string' || roomName.length < 3 || roomName.length > 50) return false;
+  if (!roomName || typeof roomName !== 'string' || roomName.length < 3 || roomName.length > 30) return false;
   if (isPrivate && (!password || typeof password !== 'string' || password.length !== 5)) return false;
   
   return true;
@@ -75,20 +72,27 @@ io.on('connection', (socket) => {
 
   socket.on('create-room', (data) => {
     try {
-      if (!validateRoomData(data)) {
+      if (!data || typeof data !== 'object') {
         socket.emit('room-error', 'Invalid room data');
         return;
       }
 
-      const { roomId, settings } = data;
+      const { settings } = data;
       
       if (!validateSettings(settings)) {
         socket.emit('room-error', 'Invalid game settings');
         return;
       }
       
-      if (rooms.has(roomId)) {
-        socket.emit('room-error', 'Room already exists');
+      let roomId;
+      let attempts = 0;
+      do {
+        roomId = generateRoomId();
+        attempts++;
+      } while (rooms.has(roomId) && attempts < 10);
+
+      if (attempts >= 10) {
+        socket.emit('room-error', 'Failed to generate unique room ID');
         return;
       }
 
@@ -106,7 +110,7 @@ io.on('connection', (socket) => {
       socket.join(roomId);
       
       console.log(`Room ${roomId} created by ${socket.id}`);
-      socket.emit('room-created', true);
+      socket.emit('room-created', { success: true, roomId });
       socket.emit('existing-users', []);
     } catch (error) {
       console.error('Error creating room:', error);
@@ -125,8 +129,8 @@ io.on('connection', (socket) => {
         password = data.password;
       }
 
-      if (!roomId || typeof roomId !== 'string') {
-        socket.emit('room-error', 'Invalid room ID');
+      if (!roomId || typeof roomId !== 'string' || !/^\d{6}$/.test(roomId)) {
+        socket.emit('room-error', 'Invalid room ID. Must be 6 digits.');
         return;
       }
 
@@ -165,7 +169,8 @@ io.on('connection', (socket) => {
       socket.emit('room-joined', {
         settings: room.settings,
         gameStarted: room.gameStarted,
-        host: room.host
+        host: room.host,
+        roomId: roomId
       });
       socket.emit('existing-users', existingUsers);
       socket.to(roomId).emit('user-joined', socket.id);
