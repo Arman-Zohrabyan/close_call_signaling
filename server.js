@@ -52,11 +52,14 @@ function validateRoomData(data) {
 
 function validateSettings(settings) {
   if (!settings || typeof settings !== 'object') return false;
-  const { maxUsers, answerTime, questionCount } = settings;
+  const { maxUsers, answerTime, questionCount, isPrivate, password, roomName } = settings;
   
   if (!Number.isInteger(maxUsers) || maxUsers < 2 || maxUsers > 10) return false;
   if (!Number.isInteger(answerTime) || answerTime < 5 || answerTime > 60) return false;
   if (!Number.isInteger(questionCount) || questionCount < 1 || questionCount > 50) return false;
+  if (typeof isPrivate !== 'boolean') return false;
+  if (!roomName || typeof roomName !== 'string' || roomName.length < 3 || roomName.length > 50) return false;
+  if (isPrivate && (!password || typeof password !== 'string' || password.length !== 5)) return false;
   
   return true;
 }
@@ -111,8 +114,17 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('join-room', (roomId) => {
+  socket.on('join-room', (data) => {
     try {
+      let roomId, password;
+      
+      if (typeof data === 'string') {
+        roomId = data;
+      } else if (data && typeof data === 'object') {
+        roomId = data.roomId;
+        password = data.password;
+      }
+
       if (!roomId || typeof roomId !== 'string') {
         socket.emit('room-error', 'Invalid room ID');
         return;
@@ -122,6 +134,11 @@ io.on('connection', (socket) => {
       
       if (!room) {
         socket.emit('room-error', 'Room does not exist');
+        return;
+      }
+
+      if (room.settings.isPrivate && room.settings.password !== password) {
+        socket.emit('room-error', 'Incorrect password');
         return;
       }
 
@@ -157,6 +174,31 @@ io.on('connection', (socket) => {
     } catch (error) {
       console.error('Error joining room:', error);
       socket.emit('room-error', 'Failed to join room');
+    }
+  });
+
+  socket.on('get-public-rooms', () => {
+    try {
+      const publicRooms = [];
+      rooms.forEach((room, roomId) => {
+        if (!room.settings.isPrivate && !room.gameStarted) {
+          publicRooms.push({
+            id: roomId,
+            name: room.settings.roomName,
+            playerCount: room.users.size,
+            maxPlayers: room.settings.maxUsers,
+            settings: {
+              maxUsers: room.settings.maxUsers,
+              answerTime: room.settings.answerTime,
+              questionCount: room.settings.questionCount
+            }
+          });
+        }
+      });
+      socket.emit('public-rooms', publicRooms);
+    } catch (error) {
+      console.error('Error getting public rooms:', error);
+      socket.emit('room-error', 'Failed to get public rooms');
     }
   });
 
