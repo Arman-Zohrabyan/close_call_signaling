@@ -21,8 +21,8 @@ app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: Date.now() 
 
 const rooms = new Map();
 const userRooms = new Map();
-const activeNicknames = new Map(); // Map deviceId -> nickname
-const socketToUser = new Map(); // Map socketId -> {nickname, deviceId}
+const activeNicknames = new Map();
+const socketToUser = new Map();
 
 function removeUserFromRoom(socketId, roomId) {
   const room = rooms.get(roomId);
@@ -74,13 +74,10 @@ io.on('connection', (socket) => {
 
   const { nickname, deviceId } = userAuth;
   
-  // Check if nickname is already taken by a different device
   const existingNickname = activeNicknames.get(deviceId);
   if (existingNickname && existingNickname !== nickname) {
-    // Same device, different nickname - update it
     activeNicknames.set(deviceId, nickname);
   } else {
-    // Check if nickname is taken by another device
     const nicknameInUse = Array.from(activeNicknames.values()).includes(nickname);
     if (nicknameInUse) {
       socket.emit('nickname-taken', `Nickname "${nickname}" is already in use. Please choose another one.`);
@@ -207,7 +204,6 @@ io.on('connection', (socket) => {
       userRooms.set(socket.id, roomId);
       room.users.add(socket.id);
       
-      // Send existing users with their info
       const existingUsers = Array.from(room.users)
         .filter(id => id !== socket.id)
         .map(id => {
@@ -227,7 +223,6 @@ io.on('connection', (socket) => {
       });
       socket.emit('existing-users', existingUsers);
       
-      // Notify others about the new user
       socket.to(roomId).emit('user-joined', {
         id: socket.id,
         nickname,
@@ -268,12 +263,12 @@ io.on('connection', (socket) => {
 
   socket.on('leave-room', () => {
     try {
-      const roomId = userRooms.get(userIdentifier);
+      const roomId = userRooms.get(socket.id);
       if (roomId) {
-        removeUserFromRoom(userIdentifier, roomId);
+        removeUserFromRoom(socket.id, roomId);
         socket.leave(roomId);
-        socket.to(roomId).emit('user-left', userIdentifier);
-        console.log(`User ${userIdentifier} left room ${roomId}`);
+        socket.to(roomId).emit('user-left', socket.id);
+        console.log(`User ${socket.id} left room ${roomId}`);
       }
     } catch (error) {
       console.error('Error leaving room:', error);
@@ -282,11 +277,11 @@ io.on('connection', (socket) => {
 
   socket.on('start-game', () => {
     try {
-      const roomId = userRooms.get(userIdentifier);
+      const roomId = userRooms.get(socket.id);
       if (!roomId) return;
 
       const room = rooms.get(roomId);
-      if (!room || room.host !== userIdentifier || room.gameStarted) {
+      if (!room || room.host !== socket.id || room.gameStarted) {
         socket.emit('room-error', 'Cannot start game');
         return;
       }
@@ -298,7 +293,7 @@ io.on('connection', (socket) => {
 
       room.gameStarted = true;
       socket.to(roomId).emit('game-started');
-      console.log(`Game started in room ${roomId} by ${userIdentifier}`);
+      console.log(`Game started in room ${roomId} by ${socket.id}`);
     } catch (error) {
       console.error('Error starting game:', error);
       socket.emit('room-error', 'Failed to start game');
@@ -314,7 +309,7 @@ io.on('connection', (socket) => {
 
       socket.to(data.target).emit('offer', {
         sdp: data.sdp,
-        sender: userIdentifier
+        sender: socket.id
       });
     } catch (error) {
       console.error('Error handling offer:', error);
@@ -330,7 +325,7 @@ io.on('connection', (socket) => {
 
       socket.to(data.target).emit('answer', {
         sdp: data.sdp,
-        sender: userIdentifier
+        sender: socket.id
       });
     } catch (error) {
       console.error('Error handling answer:', error);
@@ -346,7 +341,7 @@ io.on('connection', (socket) => {
 
       socket.to(data.target).emit('ice-candidate', {
         candidate: data.candidate,
-        sender: userIdentifier
+        sender: socket.id
       });
     } catch (error) {
       console.error('Error handling ICE candidate:', error);
@@ -355,11 +350,11 @@ io.on('connection', (socket) => {
 
   socket.on('game-event', (data) => {
     try {
-      const roomId = userRooms.get(userIdentifier);
+      const roomId = userRooms.get(socket.id);
       if (roomId && data) {
         socket.to(roomId).emit('game-event', {
           ...data,
-          sender: userIdentifier,
+          sender: socket.id,
           timestamp: Date.now()
         });
       }
