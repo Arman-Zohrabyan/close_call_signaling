@@ -147,9 +147,15 @@ io.on('connection', (socket) => {
         return;
       }
 
-      if (room.settings.isPrivate && room.settings.password !== password) {
-        socket.emit('room-error', 'Incorrect password');
-        return;
+      if (room.settings.isPrivate) {
+        if (!password) {
+          socket.emit('password-required', roomId);
+          return; 
+        }
+        if (room.settings.password !== password) {
+          socket.emit('room-error', 'Incorrect password');
+          return;
+        }
       }
 
       if (room.gameStarted) {
