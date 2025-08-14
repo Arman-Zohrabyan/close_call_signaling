@@ -21,13 +21,20 @@ app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: Date.now() 
 
 const rooms = new Map();
 const userRooms = new Map();
+const activeNicknames = new Set();
+const socketToIdentifier = new Map();
 
-function removeUserFromRoom(userId, roomId) {
+function extractNickname(userIdentifier) {
+  const parts = userIdentifier.split('_');
+  return parts.slice(0, -1).join('_') || userIdentifier;
+}
+
+function removeUserFromRoom(userIdentifier, roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
 
-  room.users.delete(userId);
-  userRooms.delete(userId);
+  room.users.delete(userIdentifier);
+  userRooms.delete(userIdentifier);
   
   if (room.users.size === 0) {
     rooms.delete(roomId);
@@ -35,7 +42,7 @@ function removeUserFromRoom(userId, roomId) {
     return;
   }
 
-  if (room.host === userId) {
+  if (room.host === userIdentifier) {
     const newHost = Array.from(room.users)[0];
     room.host = newHost;
     io.to(roomId).emit('new-host', newHost);
@@ -62,7 +69,26 @@ function validateSettings(settings) {
 }
 
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
+  const userIdentifier = socket.handshake.auth?.userIdentifier;
+  
+  if (!userIdentifier) {
+    socket.emit('room-error', 'Invalid user identifier');
+    socket.disconnect();
+    return;
+  }
+
+  const nickname = extractNickname(userIdentifier);
+  
+  if (activeNicknames.has(nickname)) {
+    socket.emit('nickname-taken', `Nickname "${nickname}" is already in use. Please choose another one.`);
+    socket.disconnect();
+    return;
+  }
+
+  activeNicknames.add(nickname);
+  socketToIdentifier.set(socket.id, userIdentifier);
+  
+  console.log('User connected:', userIdentifier);
   
   socket.on('ping', (callback) => {
     if (typeof callback === 'function') {
@@ -104,18 +130,18 @@ io.on('connection', (socket) => {
 
       const room = {
         id: finalRoomId,
-        host: socket.id,
-        users: new Set([socket.id]),
+        host: userIdentifier,
+        users: new Set([userIdentifier]),
         settings: settings,
         gameStarted: false,
         createdAt: Date.now()
       };
 
       rooms.set(finalRoomId, room);
-      userRooms.set(socket.id, finalRoomId);
+      userRooms.set(userIdentifier, finalRoomId);
       socket.join(finalRoomId);
       
-      console.log(`Room ${finalRoomId} created by ${socket.id}`);
+      console.log(`Room ${finalRoomId} created by ${userIdentifier}`);
       socket.emit('room-created', { success: true, roomId: finalRoomId });
       socket.emit('existing-users', []);
     } catch (error) {
@@ -168,16 +194,16 @@ io.on('connection', (socket) => {
         return;
       }
 
-      if (room.users.has(socket.id)) {
+      if (room.users.has(userIdentifier)) {
         socket.emit('room-error', 'Already in room');
         return;
       }
 
       socket.join(roomId);
-      userRooms.set(socket.id, roomId);
-      room.users.add(socket.id);
+      userRooms.set(userIdentifier, roomId);
+      room.users.add(userIdentifier);
       
-      const existingUsers = Array.from(room.users).filter(id => id !== socket.id);
+      const existingUsers = Array.from(room.users).filter(id => id !== userIdentifier);
       socket.emit('room-joined', {
         settings: room.settings,
         gameStarted: room.gameStarted,
@@ -185,9 +211,9 @@ io.on('connection', (socket) => {
         roomId: roomId
       });
       socket.emit('existing-users', existingUsers);
-      socket.to(roomId).emit('user-joined', socket.id);
+      socket.to(roomId).emit('user-joined', userIdentifier);
       
-      console.log(`User ${socket.id} joined room ${roomId} (${room.users.size}/${room.settings.maxUsers})`);
+      console.log(`User ${userIdentifier} joined room ${roomId} (${room.users.size}/${room.settings.maxUsers})`);
     } catch (error) {
       console.error('Error joining room:', error);
       socket.emit('room-error', 'Failed to join room');
@@ -221,12 +247,12 @@ io.on('connection', (socket) => {
 
   socket.on('leave-room', () => {
     try {
-      const roomId = userRooms.get(socket.id);
+      const roomId = userRooms.get(userIdentifier);
       if (roomId) {
-        removeUserFromRoom(socket.id, roomId);
+        removeUserFromRoom(userIdentifier, roomId);
         socket.leave(roomId);
-        socket.to(roomId).emit('user-left', socket.id);
-        console.log(`User ${socket.id} left room ${roomId}`);
+        socket.to(roomId).emit('user-left', userIdentifier);
+        console.log(`User ${userIdentifier} left room ${roomId}`);
       }
     } catch (error) {
       console.error('Error leaving room:', error);
@@ -235,11 +261,11 @@ io.on('connection', (socket) => {
 
   socket.on('start-game', () => {
     try {
-      const roomId = userRooms.get(socket.id);
+      const roomId = userRooms.get(userIdentifier);
       if (!roomId) return;
 
       const room = rooms.get(roomId);
-      if (!room || room.host !== socket.id || room.gameStarted) {
+      if (!room || room.host !== userIdentifier || room.gameStarted) {
         socket.emit('room-error', 'Cannot start game');
         return;
       }
@@ -251,7 +277,7 @@ io.on('connection', (socket) => {
 
       room.gameStarted = true;
       socket.to(roomId).emit('game-started');
-      console.log(`Game started in room ${roomId} by ${socket.id}`);
+      console.log(`Game started in room ${roomId} by ${userIdentifier}`);
     } catch (error) {
       console.error('Error starting game:', error);
       socket.emit('room-error', 'Failed to start game');
@@ -267,7 +293,7 @@ io.on('connection', (socket) => {
 
       socket.to(data.target).emit('offer', {
         sdp: data.sdp,
-        sender: socket.id
+        sender: userIdentifier
       });
     } catch (error) {
       console.error('Error handling offer:', error);
@@ -283,7 +309,7 @@ io.on('connection', (socket) => {
 
       socket.to(data.target).emit('answer', {
         sdp: data.sdp,
-        sender: socket.id
+        sender: userIdentifier
       });
     } catch (error) {
       console.error('Error handling answer:', error);
@@ -299,7 +325,7 @@ io.on('connection', (socket) => {
 
       socket.to(data.target).emit('ice-candidate', {
         candidate: data.candidate,
-        sender: socket.id
+        sender: userIdentifier
       });
     } catch (error) {
       console.error('Error handling ICE candidate:', error);
@@ -308,11 +334,11 @@ io.on('connection', (socket) => {
 
   socket.on('game-event', (data) => {
     try {
-      const roomId = userRooms.get(socket.id);
+      const roomId = userRooms.get(userIdentifier);
       if (roomId && data) {
         socket.to(roomId).emit('game-event', {
           ...data,
-          sender: socket.id,
+          sender: userIdentifier,
           timestamp: Date.now()
         });
       }
@@ -322,21 +348,24 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', (reason) => {
-    console.log('User disconnected:', socket.id, 'Reason:', reason);
+    console.log('User disconnected:', userIdentifier, 'Reason:', reason);
     
     try {
-      const roomId = userRooms.get(socket.id);
+      const roomId = userRooms.get(userIdentifier);
       if (roomId) {
-        removeUserFromRoom(socket.id, roomId);
-        socket.to(roomId).emit('user-left', socket.id);
+        removeUserFromRoom(userIdentifier, roomId);
+        socket.to(roomId).emit('user-left', userIdentifier);
       }
+      
+      activeNicknames.delete(nickname);
+      socketToIdentifier.delete(socket.id);
     } catch (error) {
       console.error('Error handling disconnect:', error);
     }
   });
 
   socket.on('error', (error) => {
-    console.error('Socket error:', socket.id, error);
+    console.error('Socket error:', userIdentifier, error);
   });
 });
 
